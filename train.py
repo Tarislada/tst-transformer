@@ -22,6 +22,7 @@ from datetime import datetime
 import argparse
 import sys
 import numpy as np
+from sklearn.metrics import f1_score
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent))
@@ -60,6 +61,10 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, threshold, w
     correct = 0
     total = 0
     
+    # Collect all predictions and labels for F1
+    all_preds = []
+    all_labels = []
+    
     pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]")
     for batch_idx, (features, labels) in enumerate(pbar):
         features = features.to(device)  # [B, T, C]
@@ -86,6 +91,10 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, threshold, w
         correct += (predictions == labels_flat.long()).sum().item()
         total += labels_flat.size(0)
         
+        # Store for F1 calculation
+        all_preds.extend(predictions.cpu().numpy())
+        all_labels.extend(labels_flat.long().cpu().numpy())
+        
         # Update progress bar
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
@@ -99,7 +108,12 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, threshold, w
     avg_loss = total_loss / len(loader)
     accuracy = 100.0 * correct / total
     
-    return avg_loss, accuracy
+    # Calculate F1 scores
+    f1_macro = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    f1_mobile = f1_score(all_labels, all_preds, pos_label=0, zero_division=0)
+    f1_immobile = f1_score(all_labels, all_preds, pos_label=1, zero_division=0)
+    
+    return avg_loss, accuracy, f1_macro, f1_mobile, f1_immobile
 
 
 def validate_epoch(model, loader, criterion, device, epoch, threshold, writer=None):
@@ -113,6 +127,10 @@ def validate_epoch(model, loader, criterion, device, epoch, threshold, writer=No
     # Per-class metrics
     class_correct = {0: 0, 1: 0}
     class_total = {0: 0, 1: 0}
+    
+    # Collect all predictions and labels for F1
+    all_preds = []
+    all_labels = []
     
     with torch.no_grad():
         for features, labels in loader:
@@ -142,6 +160,10 @@ def validate_epoch(model, loader, criterion, device, epoch, threshold, writer=No
                     class_total[label] += mask.sum().item()
                     class_correct[label] += predictions[mask].eq(labels_long[mask]).sum().item()
             
+            # Store for F1
+            all_preds.extend(predictions.cpu().numpy())
+            all_labels.extend(labels_long.cpu().numpy())
+            
             total_loss += loss.item()
     
     # Calculate metrics
@@ -151,12 +173,18 @@ def validate_epoch(model, loader, criterion, device, epoch, threshold, writer=No
     mobile_acc = 100.0 * class_correct[0] / class_total[0] if class_total[0] > 0 else 0.0
     immobile_acc = 100.0 * class_correct[1] / class_total[1] if class_total[1] > 0 else 0.0
     
+    # Calculate F1 scores
+    f1_macro = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    f1_mobile = f1_score(all_labels, all_preds, pos_label=0, zero_division=0)
+    f1_immobile = f1_score(all_labels, all_preds, pos_label=1, zero_division=0)
+    
     print(f"\nValidation Epoch {epoch}:")
     print(f"  Total frames: {total}")
     print(f"  Mobile: {class_total[0]} ({100*class_total[0]/total:.1f}%)")
     print(f"  Immobile: {class_total[1]} ({100*class_total[1]/total:.1f}%)")
-    print(f"  Mobile Acc: {mobile_acc:.2f}%")
-    print(f"  Immobile Acc: {immobile_acc:.2f}%\n")
+    print(f"  Mobile Acc: {mobile_acc:.2f}% | F1: {f1_mobile:.3f}")
+    print(f"  Immobile Acc: {immobile_acc:.2f}% | F1: {f1_immobile:.3f}")
+    print(f"  Macro F1: {f1_macro:.3f}\n")
     
     # Log to tensorboard
     if writer:
@@ -164,8 +192,11 @@ def validate_epoch(model, loader, criterion, device, epoch, threshold, writer=No
         writer.add_scalar('Val/Accuracy', accuracy, epoch)
         writer.add_scalar('Val/Mobile_Acc', mobile_acc, epoch)
         writer.add_scalar('Val/Immobile_Acc', immobile_acc, epoch)
+        writer.add_scalar('Val/F1_Macro', f1_macro, epoch)
+        writer.add_scalar('Val/F1_Mobile', f1_mobile, epoch)
+        writer.add_scalar('Val/F1_Immobile', f1_immobile, epoch)
     
-    return avg_loss, accuracy, (mobile_acc, immobile_acc)
+    return avg_loss, accuracy, (mobile_acc, immobile_acc), (f1_macro, f1_mobile, f1_immobile)
 
 
 def save_checkpoint(model, optimizer, epoch, val_loss, val_accuracy, filepath):
@@ -250,7 +281,7 @@ def main():
                         help="Number of attention heads")
     parser.add_argument("--num_layers", type=int, default=2,
                         help="Number of transformer layers")
-    parser.add_argument("--dropout", type=float, default=0.1,
+    parser.add_argument("--dropout", type=float, default=0.3,
                         help="Dropout rate")
     
     # Training parameters
@@ -375,8 +406,19 @@ def main():
     )
     
     # Setup learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    #     optimizer, mode='min', factor=0.5, patience=5
+    # )
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        steps_per_epoch=len(train_loader),
+        epochs=args.epochs,
+        pct_start=0.1,
+        anneal_strategy='cos',
+        div_factor=25.0,
+        final_div_factor=1000,
     )
     
     # Resume from checkpoint if specified
@@ -405,36 +447,39 @@ def main():
     
     for epoch in range(start_epoch, args.epochs):
         # Train
-        train_loss, train_acc = train_epoch(
+        train_loss, train_acc, train_f1_macro, train_f1_mobile, train_f1_immobile = train_epoch(
             model, train_loader, criterion, optimizer, args.device, epoch, args.decision_threshold, writer
         )
         
         # Validate
-        val_loss, val_acc, (mobile_acc, immobile_acc) = validate_epoch(
+        val_loss, val_acc, (mobile_acc, immobile_acc), (val_f1_macro, val_f1_mobile, val_f1_immobile) = validate_epoch(
             model, val_loader, criterion, args.device, epoch, args.decision_threshold, writer
         )
         
         # Learning rate scheduling
-        scheduler.step(val_loss)
+        scheduler.step()
         
         # Log to tensorboard
         writer.add_scalar('Train/Loss', train_loss, epoch)
         writer.add_scalar('Train/Accuracy', train_acc, epoch)
+        writer.add_scalar('Train/F1_Macro', train_f1_macro, epoch)
+        writer.add_scalar('Train/F1_Mobile', train_f1_mobile, epoch)
+        writer.add_scalar('Train/F1_Immobile', train_f1_immobile, epoch)
         writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
         
         # Print summary
         print(f"Epoch {epoch}: "
-              f"train_loss={train_loss:.4f}, train_acc={train_acc:.2f}%, "
-              f"val_loss={val_loss:.4f}, val_acc={val_acc:.2f}%")
+              f"train_loss={train_loss:.4f}, train_acc={train_acc:.2f}%, train_f1={train_f1_macro:.3f} | "
+              f"val_loss={val_loss:.4f}, val_acc={val_acc:.2f}%, val_f1={val_f1_macro:.3f}")
         
-        # Save best model
-        if val_acc > best_val_accuracy:
-            best_val_accuracy = val_acc
+        # Save best model based on F1 instead of accuracy
+        if val_f1_immobile > best_val_accuracy:  # Track immobile F1 as "best"
+            best_val_accuracy = val_f1_immobile
             save_checkpoint(
                 model, optimizer, epoch, val_loss, val_acc,
                 output_dir / "best_model.pt"
             )
-            print(f"  ✓ Saved best model (val_acc={val_acc:.2f}%)")
+            print(f"  ✓ Saved best model (immobile_f1={val_f1_immobile:.3f})")
             patience_counter = 0
         else:
             patience_counter += 1
