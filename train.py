@@ -409,17 +409,17 @@ def main():
     # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
     #     optimizer, mode='min', factor=0.5, patience=5
     # )
-    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        steps_per_epoch=len(train_loader),
-        epochs=args.epochs,
-        pct_start=0.1,
-        anneal_strategy='cos',
-        div_factor=25.0,
-        final_div_factor=1000,
-    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    # scheduler = optim.lr_scheduler.OneCycleLR(
+    #     optimizer,
+    #     max_lr=args.lr,
+    #     steps_per_epoch=len(train_loader),
+    #     epochs=args.epochs,
+    #     pct_start=0.1,
+    #     anneal_strategy='cos',
+    #     div_factor=25.0,
+    #     final_div_factor=1000,
+    # )
     
     # Resume from checkpoint if specified
     start_epoch = 0
