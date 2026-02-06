@@ -20,6 +20,7 @@ import sys
 sys.path.append(str(Path(__file__).parent))
 
 from model import YOLOFeatureExtractor, TSTModel
+from postprocess import aggregate_frames_to_seconds
 
 
 def extract_features_from_video(video_path: str, yolo_path: str, layer_name: str, 
@@ -104,19 +105,128 @@ def predict_per_second(features: np.ndarray, model: TSTModel, window_seconds: fl
     return np.array(predictions), np.array(confidences)
 
 
+def predict_frames_with_aggregation(
+    features: np.ndarray, 
+    model: TSTModel, 
+    window_size: int,
+    fps: int,
+    device: str,
+    aggregate_method: str = 'majority'
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate frame-level predictions and aggregate to seconds.
+    
+    This is the CORRECT way to do inference:
+    1. Extract sliding windows from features
+    2. Model predicts per-frame binary logits [B, T, 1]
+    3. Average overlapping frame predictions
+    4. Aggregate frames to seconds using postprocess.py
+    
+    Args:
+        features: [num_frames, feature_dim] numpy array
+        model: Trained TST model
+        window_size: Window size in FRAMES (e.g., 120 frames)
+        fps: Video frames per second
+        device: Device to run inference on
+        aggregate_method: Method to aggregate frames to seconds
+        
+    Returns:
+        frame_predictions: [num_frames] array of 0/1 predictions
+        frame_confidences: [num_frames] array of probabilities for predicted class
+        second_predictions: [num_seconds] array of 0/1 predictions  
+        second_confidences: [num_seconds] array of averaged frame confidences per second
+    """
+    model.eval()
+    
+    num_frames = features.shape[0]
+    
+    # Accumulate frame probabilities (for overlapping windows)
+    frame_probs = np.zeros(num_frames, dtype=np.float32)
+    frame_counts = np.zeros(num_frames, dtype=np.int32)
+    
+    print(f"Generating frame-level predictions...")
+    print(f"  Total frames: {num_frames}")
+    print(f"  Window size: {window_size} frames")
+    print(f"  FPS: {fps}")
+    
+    with torch.no_grad():
+        # Sliding window over all frames (NO stride - full coverage)
+        for start_idx in tqdm(range(0, num_frames, window_size), desc="Predicting windows"):
+            end_idx = min(start_idx + window_size, num_frames)
+            window_features = features[start_idx:end_idx]
+            
+            # Pad if last window is incomplete
+            actual_length = window_features.shape[0]
+            if actual_length < window_size:
+                padding = np.zeros((window_size - actual_length, features.shape[1]), dtype=np.float32)
+                window_features = np.concatenate([window_features, padding], axis=0)
+            
+            # Convert to tensor [1, T, C]
+            window_tensor = torch.from_numpy(window_features).unsqueeze(0).float().to(device)
+            
+            # Predict: model outputs [1, T, 1] binary logits
+            logits = model(window_tensor)  # [1, window_size, 1]
+            
+            # Convert to probabilities
+            probs = torch.sigmoid(logits).squeeze(-1).cpu().numpy()[0]  # [window_size]
+            
+            # Accumulate only the valid frames (not padding)
+            valid_probs = probs[:actual_length]
+            frame_probs[start_idx:end_idx] += valid_probs
+            frame_counts[start_idx:end_idx] += 1
+    
+    # Average overlapping predictions
+    frame_probs = frame_probs / np.maximum(frame_counts, 1)
+    
+    # Threshold to get binary predictions
+    frame_predictions = (frame_probs > 0.5).astype(int)
+    
+    # Confidence = probability of predicted class
+    frame_confidences = np.where(
+        frame_predictions == 1, 
+        frame_probs,           # If pred=1, confidence = p(immobile)
+        1.0 - frame_probs      # If pred=0, confidence = p(mobile)
+    )
+    
+    print(f"✓ Frame predictions complete")
+    print(f"  Immobile frames: {(frame_predictions == 1).sum()} ({100.0 * (frame_predictions == 1).mean():.1f}%)")
+    
+    # Aggregate to seconds
+    print(f"\nAggregating to seconds (method={aggregate_method})...")
+    second_predictions = aggregate_frames_to_seconds(
+        frame_predictions=frame_predictions,
+        fps=fps,
+        method=aggregate_method
+    )
+    
+    # Calculate per-second confidence as mean of frame confidences
+    num_seconds = len(second_predictions)
+    second_confidences = np.zeros(num_seconds, dtype=np.float32)
+    
+    for sec in range(num_seconds):
+        start_frame = sec * fps
+        end_frame = min((sec + 1) * fps, num_frames)
+        second_confidences[sec] = frame_confidences[start_frame:end_frame].mean()
+    
+    print(f"✓ Second-level aggregation complete")
+    print(f"  Total seconds: {num_seconds}")
+    print(f"  Immobile seconds: {(second_predictions == 1).sum()} ({100.0 * (second_predictions == 1).mean():.1f}%)")
+    
+    return frame_predictions, frame_confidences, second_predictions, second_confidences
+
+
 def save_predictions_csv(predictions: np.ndarray, confidences: np.ndarray, 
-                         output_path: str, video_name: str = None):
+                         output_path: str, video_name: str = None, level: str = "second"):
     """
     Save predictions to CSV file.
     
-    Format:
-        second,prediction,confidence
-        0,0,0.95
-        1,0,0.87
-        2,1,0.92
+    Args:
+        level: "frame" or "second" - changes the index column name
     """
+    time_col = 'frame' if level == 'frame' else 'second'
+    
     df = pd.DataFrame({
-        'second': range(len(predictions)),
+        time_col: range(len(predictions)),
         'prediction': predictions.astype(int),
         'confidence': confidences
     })
@@ -125,15 +235,14 @@ def save_predictions_csv(predictions: np.ndarray, confidences: np.ndarray,
     with open(output_path, 'w') as f:
         if video_name:
             f.write(f"# Video: {video_name}\n")
-        f.write(f"# Total seconds: {len(predictions)}\n")
+        f.write(f"# Total {level}s: {len(predictions)}\n")
         f.write(f"# Mobile (0): {(predictions == 0).sum()}\n")
         f.write(f"# Immobile (1): {(predictions == 1).sum()}\n")
         f.write("# prediction: 0=mobile, 1=immobile\n")
         f.write("# confidence: probability of predicted class\n")
         df.to_csv(f, index=False)
     
-    print(f"✓ Saved predictions to {output_path}")
-    print(f"  Total seconds: {len(predictions)}")
+    print(f"✓ Saved {level}-level predictions to {output_path}")
     print(f"  Mobile: {(predictions == 0).sum()} ({100.0 * (predictions == 0).mean():.1f}%)")
     print(f"  Immobile: {(predictions == 1).sum()} ({100.0 * (predictions == 1).mean():.1f}%)")
 
@@ -152,24 +261,33 @@ def main():
     # Output
     parser.add_argument("--output", type=str, default=None,
                         help="Output CSV path (default: <video_name>_predictions.csv)")
+    parser.add_argument("--save_frame_predictions", action="store_true",
+                        help="Also save frame-level predictions")
     
     # YOLO settings (should match training)
     parser.add_argument("--layer_name", type=str, default="model.18",
                         help="YOLO layer for feature extraction (must match training)")
-    parser.add_argument("--imgsz", type=int, default=1080,
+    parser.add_argument("--imgsz", type=int, default=1088,
                         help="YOLO input size (must match YOLO training)")
     
     # Model settings (should match training)
-    parser.add_argument("--window_seconds", type=float, default=2.0,
-                        help="Temporal window size (must match training)")
+    parser.add_argument("--window_size", type=int, default=120,
+                        help="Temporal window size in FRAMES (must match training, e.g., 120)")
+    parser.add_argument("--window_seconds", type=float, default=None,
+                        help="Alternative: specify window in seconds (converted to frames using fps)")
     parser.add_argument("--fps", type=int, default=30,
                         help="Video frames per second")
-    parser.add_argument("--hidden_dim", type=int, default=256,
+    parser.add_argument("--hidden_dim", type=int, default=512,
                         help="Model hidden dimension (must match training)")
     parser.add_argument("--num_heads", type=int, default=4,
                         help="Number of attention heads (must match training)")
-    parser.add_argument("--num_layers", type=int, default=2,
+    parser.add_argument("--num_layers", type=int, default=4,
                         help="Number of transformer layers (must match training)")
+    
+    # Aggregation settings
+    parser.add_argument("--aggregate_method", type=str, default='majority',
+                        choices=['majority', 'any', 'all', 'mean_threshold'],
+                        help="Method to aggregate frame predictions to seconds")
     
     # Processing settings
     parser.add_argument("--batch_size", type=int, default=8,
@@ -182,6 +300,11 @@ def main():
                         help="Path to config.json from training (overrides individual params)")
     
     args = parser.parse_args()
+    
+    # Handle window_seconds option
+    if args.window_seconds is not None:
+        args.window_size = int(args.window_seconds * args.fps)
+        print(f"Converting window_seconds={args.window_seconds}s to window_size={args.window_size} frames")
     
     # Validate paths
     if not Path(args.video).exists():
@@ -200,7 +323,7 @@ def main():
             config = json.load(f)
         # Override args with config values
         for key, value in config.items():
-            if hasattr(args, key) and key not in ['video', 'model', 'output', 'config']:
+            if hasattr(args, key) and key not in ['video', 'model', 'output', 'config', 'save_frame_predictions']:
                 setattr(args, key, value)
         print(f"✓ Loaded config from {args.config}")
     
@@ -240,6 +363,7 @@ def main():
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
+        max_seq_length=args.window_size,
     ).to(device)
     
     # Load checkpoint
@@ -257,12 +381,13 @@ def main():
     print("STEP 3: INFERENCE")
     print("=" * 60)
     
-    predictions, confidences = predict_per_second(
+    frame_preds, frame_confs, second_preds, second_confs = predict_frames_with_aggregation(
         features=features,
         model=model,
-        window_seconds=args.window_seconds,
+        window_size=args.window_size,
         fps=args.fps,
-        device=device
+        device=device,
+        aggregate_method=args.aggregate_method
     )
     
     # Step 4: Save results
@@ -271,7 +396,14 @@ def main():
     print("=" * 60)
     
     video_name = Path(args.video).name
-    save_predictions_csv(predictions, confidences, args.output, video_name)
+    
+    # Save second-level predictions (primary output)
+    save_predictions_csv(second_preds, second_confs, args.output, video_name, level="second")
+    
+    # Optionally save frame-level predictions
+    if args.save_frame_predictions:
+        frame_output = args.output.replace('.csv', '_frames.csv')
+        save_predictions_csv(frame_preds, frame_confs, frame_output, video_name, level="frame")
     
     print("\n" + "=" * 60)
     print("INFERENCE COMPLETE")
