@@ -111,7 +111,8 @@ def predict_frames_with_aggregation(
     window_size: int,
     fps: int,
     device: str,
-    aggregate_method: str = 'majority'
+    aggregate_method: str = 'majority',
+    confidence_threshold: float = None  # Add this parameter
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate frame-level predictions and aggregate to seconds.
@@ -129,6 +130,7 @@ def predict_frames_with_aggregation(
         fps: Video frames per second
         device: Device to run inference on
         aggregate_method: Method to aggregate frames to seconds
+        confidence_threshold: Minimum confidence to keep immobility predictions
         
     Returns:
         frame_predictions: [num_frames] array of 0/1 predictions
@@ -191,12 +193,17 @@ def predict_frames_with_aggregation(
     print(f"✓ Frame predictions complete")
     print(f"  Immobile frames: {(frame_predictions == 1).sum()} ({100.0 * (frame_predictions == 1).mean():.1f}%)")
     
-    # Aggregate to seconds
+    # Aggregate to seconds with confidence filtering
     print(f"\nAggregating to seconds (method={aggregate_method})...")
+    if confidence_threshold is not None:
+        print(f"  Applying confidence threshold: {confidence_threshold}")
+    
     second_predictions = aggregate_frames_to_seconds(
         frame_predictions=frame_predictions,
+        frame_probabilities=frame_probs,  # Pass the probabilities
         fps=fps,
-        method=aggregate_method
+        method=aggregate_method,
+        confidence_threshold=confidence_threshold  # Add this parameter
     )
     
     # Calculate per-second confidence as mean of frame confidences
@@ -288,6 +295,9 @@ def main():
     parser.add_argument("--aggregate_method", type=str, default='majority',
                         choices=['majority', 'any', 'all', 'mean_threshold'],
                         help="Method to aggregate frame predictions to seconds")
+    parser.add_argument("--confidence_threshold", type=float, default=0.65,
+                        help="Minimum average confidence per second to keep immobility predictions (e.g., 0.6). "
+                             "Low-confidence immobility predictions are reverted to mobile.")
     
     # Processing settings
     parser.add_argument("--batch_size", type=int, default=8,
@@ -387,7 +397,8 @@ def main():
         window_size=args.window_size,
         fps=args.fps,
         device=device,
-        aggregate_method=args.aggregate_method
+        aggregate_method=args.aggregate_method,
+        confidence_threshold=args.confidence_threshold  # Add this parameter
     )
     
     # Step 4: Save results
