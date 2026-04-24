@@ -129,7 +129,7 @@ def predict_frames_with_aggregation(
         window_size: Window size in FRAMES (e.g., 120 frames)
         fps: Video frames per second
         device: Device to run inference on
-        agg_threshold: Aggregation threshold (0.0=any, 0.5=majority, 1.0=all, or custom value)
+        agg_threshold: Aggregation threshold (0.0=any, 0.5=majority, 1.0=all)
         confidence_threshold: Minimum confidence to keep immobility predictions
         
     Returns:
